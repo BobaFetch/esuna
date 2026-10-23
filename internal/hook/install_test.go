@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -66,6 +67,55 @@ func TestInstallCustomHooksPath(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "custom-hooks/pre-push")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The subprocess's file-size limit forces a real write failure without changing
+// process-global limits in the test runner or requiring a full filesystem.
+func TestInstallWriteFailureLeavesNoHook(t *testing.T) {
+	if root := os.Getenv("ESUNA_HOOK_WRITE_FAILURE_ROOT"); root != "" {
+		var limit syscall.Rlimit
+		if err := syscall.Getrlimit(syscall.RLIMIT_FSIZE, &limit); err != nil {
+			t.Fatal(err)
+		}
+		installErr := Install(root, true)
+		// Restore the soft limit so Go can write coverage data on process exit.
+		limit.Cur = limit.Max
+		if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &limit); err != nil {
+			t.Fatal(err)
+		}
+		if installErr == nil || !strings.Contains(installErr.Error(), "write pre-push hook") {
+			t.Fatalf("expected write failure, got %v", installErr)
+		}
+		if _, err := os.Lstat(filepath.Join(root, ".git/hooks/pre-push")); !os.IsNotExist(err) {
+			t.Fatalf("failed installation left a hook behind: %v", err)
+		}
+		return
+	}
+	root := t.TempDir()
+	if out, err := exec.Command("git", "init", root).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %s %v", out, err)
+	}
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sh", "-c", `ulimit -S -f 0; exec "$@"`, "sh", binary, "-test.run=^TestInstallWriteFailureLeavesNoHook$")
+	cmd.Env = append(os.Environ(), "ESUNA_HOOK_WRITE_FAILURE_ROOT="+root)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("write-failure subprocess: %v\n%s", err, out)
+	}
+	entries, err := os.ReadDir(filepath.Join(root, ".git/hooks"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".pre-push-") {
+			t.Fatalf("temporary hook left behind: %s", entry.Name())
+		}
+	}
+	if err := Install(root, true); err != nil {
+		t.Fatalf("retry after write failure: %v", err)
 	}
 }
 

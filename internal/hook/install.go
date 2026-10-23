@@ -26,13 +26,12 @@ func Install(targetRepoRoot string, gate bool) error {
 		return fmt.Errorf("create hooks directory: %w", err)
 	}
 	path := filepath.Join(dir, "pre-push")
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0755)
-	if os.IsExist(err) {
-		return fmt.Errorf("pre-push hook already exists at %s; merge manually instead", path)
-	}
+	// Stage privately and non-executable: failed writes must never publish a hook.
+	file, err := os.CreateTemp(dir, ".pre-push-*")
 	if err != nil {
-		return fmt.Errorf("create pre-push hook: %w", err)
+		return fmt.Errorf("create temporary pre-push hook: %w", err)
 	}
+	defer os.Remove(file.Name())
 	script := "#!/bin/sh\n# Requires esuna on PATH. Review from the repository root.\ncd \"$(git rev-parse --show-toplevel)\" || exit 1\n"
 	if gate {
 		script += "exec esuna --gate </dev/null\n"
@@ -46,6 +45,16 @@ func Install(targetRepoRoot string, gate bool) error {
 	}
 	if closeErr != nil {
 		return fmt.Errorf("close pre-push hook: %w", closeErr)
+	}
+	if err := os.Chmod(file.Name(), 0755); err != nil {
+		return fmt.Errorf("make pre-push hook executable: %w", err)
+	}
+	// Link atomically publishes the completed script without replacing an
+	// existing hook (unlike Rename), including one installed concurrently.
+	if err := os.Link(file.Name(), path); os.IsExist(err) {
+		return fmt.Errorf("pre-push hook already exists at %s; merge manually instead", path)
+	} else if err != nil {
+		return fmt.Errorf("publish pre-push hook: %w", err)
 	}
 	return nil
 }
