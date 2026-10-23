@@ -317,6 +317,10 @@ install-hook flags:
 }
 
 func friendlyError(err error) string {
+	return friendlyErrorWithContext(err, "review")
+}
+
+func friendlyErrorWithContext(err error, context string) string {
 	message := strings.Join(strings.Fields(err.Error()), " ")
 	switch {
 	case strings.Contains(message, "TYPESAFE_API_KEY"):
@@ -330,9 +334,9 @@ func friendlyError(err error) string {
 	case strings.Contains(message, "legacy ctags") || strings.Contains(message, "must be Universal Ctags"):
 		return "The ctags on PATH is missing or legacy; install Universal Ctags and ensure its ctags binary comes first on PATH."
 	case strings.Contains(message, "hook already exists") || strings.Contains(message, "pre-push hook already exists"):
-		return message + "; merge the desired commands manually and remove or rename the existing hook before retrying."
+		return "A pre-push hook already exists; merge the desired commands into it manually, then retry if needed."
 	default:
-		return "esuna could not complete the review: " + message + ". Check the repository, configuration, and reviewer CLI logins, then retry."
+		return "esuna could not complete " + context + ": " + message + ". Check the repository and configuration, then retry."
 	}
 }
 
@@ -352,7 +356,7 @@ func installHook(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if err := hook.Install(*target, *gate); err != nil {
-		fmt.Fprintln(stderr, friendlyError(err))
+		fmt.Fprintln(stderr, friendlyErrorWithContext(err, "install the hook"))
 		return 1
 	}
 	fmt.Fprintln(stdout, "Installed pre-push hook (requires esuna on PATH). Existing hooks are never overwritten.")
