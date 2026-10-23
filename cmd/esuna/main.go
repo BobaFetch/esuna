@@ -30,14 +30,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	flags := flag.NewFlagSet("esuna", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	jsonOutput := flags.Bool("json", false, "output JSON")
-	deep := flags.Bool("deep", false, "include repo-wide context")
-	withTests := flags.Bool("with-tests", false, "include tests in review scope")
-	verify := flags.Bool("verify", false, "verify findings with the first selected reviewer")
-	merge := flags.Bool("merge", false, "merge independent reviewer findings (default)")
-	chain := flags.Bool("chain", false, "chain reviewers in configured pool order")
-	gate := flags.Bool("gate", false, "block on confident P0 findings")
-	author := flags.String("author-model", "", "model that authored the change (overrides config)")
+	flags.Usage = func() { printUsage(stderr) }
+	jsonOutput := flags.Bool("json", false, "write the stable JSON result")
+	deep := flags.Bool("deep", false, "include repository-wide symbol context (Universal Ctags required)")
+	withTests := flags.Bool("with-tests", false, "ask reviewers to include test code and coverage")
+	verify := flags.Bool("verify", false, "ask the first selected reviewer to re-check findings")
+	merge := flags.Bool("merge", false, "run reviewers independently and merge findings (default)")
+	chain := flags.Bool("chain", false, "run reviewers sequentially in configured pool order")
+	gate := flags.Bool("gate", false, "exit nonzero for confident P0 findings")
+	author := flags.String("author-model", "", "change author CLI (claude, codex, muse, grok); excluded from review")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -52,7 +53,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "--merge and --chain are mutually exclusive")
 		return 2
 	}
-	fail := func(err error) int { fmt.Fprintln(stderr, err); return 1 }
+	fail := func(err error) int { fmt.Fprintln(stderr, friendlyError(err)); return 1 }
 	client, err := jev.NewClient()
 	if err != nil {
 		return fail(err)
@@ -266,12 +267,73 @@ func printResult(stdout io.Writer, result contract.Result, jsonOutput bool) erro
 	if _, err := fmt.Fprintf(stdout, "%s (overall confidence %.2f)\n", result.Summary, result.OverallConfidence); err != nil {
 		return err
 	}
+	byFile := make(map[string][]contract.Finding)
+	files := make([]string, 0)
 	for _, f := range result.Findings {
-		if _, err := fmt.Fprintf(stdout, "%s:%d [%s] %.2f %s\n", f.File, f.Line, f.Severity, f.Confidence, f.Message); err != nil {
+		if _, exists := byFile[f.File]; !exists {
+			files = append(files, f.File)
+		}
+		byFile[f.File] = append(byFile[f.File], f)
+	}
+	sort.Strings(files)
+	for _, file := range files {
+		if _, err := fmt.Fprintf(stdout, "\n%s\n", file); err != nil {
 			return err
+		}
+		for _, f := range byFile[file] {
+			if _, err := fmt.Fprintf(stdout, "  line %-5d [%-2s] confidence %.2f  %s\n", f.Line, f.Severity, f.Confidence, f.Message); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+func printUsage(w io.Writer) {
+	fmt.Fprintln(w, `esuna reviews the current Git change with independent coding agents and calibrates finding confidence.
+
+Usage: esuna [flags]
+
+Flags:`)
+	fmt.Fprintln(w, `  -json          write the stable JSON result
+  -deep          include repository-wide symbol context (Universal Ctags required)
+  -with-tests    ask reviewers to include test code and coverage
+  -verify        ask the first selected reviewer to re-check findings
+  -merge         run reviewers independently and merge findings (default)
+  -chain         run reviewers sequentially in configured pool order
+  -gate          exit nonzero for confident P0 findings
+  -author-model  change author CLI (claude, codex, muse, grok); excluded from review
+
+Examples:
+  esuna
+  esuna --gate
+  esuna --json
+  esuna --chain --verify
+  esuna install-hook [--target <repo-root>] [--gate]
+
+install-hook flags:
+  --target  Git repository root (default: current directory)
+  --gate    make pushes fail when esuna gates or encounters an error (default: advisory)`)
+}
+
+func friendlyError(err error) string {
+	message := strings.Join(strings.Fields(err.Error()), " ")
+	switch {
+	case strings.Contains(message, "TYPESAFE_API_KEY"):
+		return "TypeSafe API key is missing; set TYPESAFE_API_KEY before running esuna."
+	case strings.Contains(message, "not found on PATH") || strings.Contains(message, "executable file not found"):
+		return "A required CLI is missing from PATH; install and log in to the configured reviewer CLIs, and install Universal Ctags if using --deep."
+	case strings.Contains(message, "reviewer pool is empty"):
+		return "Reviewer pool is empty after author exclusion; change reviewer_pool or author_model in .esuna.conf, or pass --author-model."
+	case strings.Contains(message, ".esuna.conf line"):
+		return message + "; fix the indicated key=value line using .esuna.conf.example."
+	case strings.Contains(message, "legacy ctags") || strings.Contains(message, "must be Universal Ctags"):
+		return "The ctags on PATH is missing or legacy; install Universal Ctags and ensure its ctags binary comes first on PATH."
+	case strings.Contains(message, "hook already exists") || strings.Contains(message, "pre-push hook already exists"):
+		return message + "; merge the desired commands manually and remove or rename the existing hook before retrying."
+	default:
+		return "esuna could not complete the review: " + message + ". Check the repository, configuration, and reviewer CLI logins, then retry."
+	}
 }
 
 func installHook(args []string, stdout, stderr io.Writer) int {
@@ -290,7 +352,7 @@ func installHook(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	if err := hook.Install(*target, *gate); err != nil {
-		fmt.Fprintln(stderr, err)
+		fmt.Fprintln(stderr, friendlyError(err))
 		return 1
 	}
 	fmt.Fprintln(stdout, "Installed pre-push hook (requires esuna on PATH). Existing hooks are never overwritten.")
