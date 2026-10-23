@@ -1,0 +1,10 @@
+# Additional review guidance
+
+Copy this file to `.esuna/guidelines.md` at your repository root and replace
+these examples with your team's rules. The entire file is injected verbatim
+into every reviewer prompt, including verification prompts. It is optional.
+
+- Prefer concrete, actionable defects over style preferences.
+- Check error handling and boundary conditions.
+- Explain the failure scenario and impact in each finding message.
+- Preserve the requested `FILE|LINE|SEVERITY|MESSAGE` output format.

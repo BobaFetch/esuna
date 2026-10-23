@@ -1,0 +1,29 @@
+# Copy to .esuna.conf at your Git repository root.
+# Simple key=value lines; whitespace and full-line # comments are allowed.
+# Unknown/duplicate keys and invalid values are rejected. No inline comments.
+# Reviewer identifiers are literal CLI names, not version-specific model names.
+# Order matters for --chain. Defaults to all four; the author is excluded.
+reviewer_pool=claude,codex,muse,grok
+
+# Finite confidence in [0,1]. Only P0 findings at or above this threshold block,
+# and only with --gate. Plain esuna is advisory (exit 0 after a successful review).
+gate_threshold=0.7
+
+# Optional; --author-model wins, including an explicit --author-model="".
+# author_model=claude
+
+# Review defaults: independent reviewers with merged findings (--merge).
+# --chain runs reviewers sequentially in reviewer_pool order instead.
+# --verify uses the first remaining reviewer to re-check findings before scoring.
+# Overall confidence = mean finding confidence, or 1.0 for no findings.
+# Review base = upstream merge-base, else HEAD^, else HEAD for an initial commit.
+# Staged and unstaged changes are included; untracked files are not included.
+# A repository must have at least one commit.
+# --with-tests asks reviewers to include test code/coverage, otherwise guidance
+# focuses on production defects (test files remain available as evidence).
+
+# Hook installation: esuna install-hook [--target <repo-root>] [--gate]
+# Requires esuna on PATH. Respects Git worktrees and core.hooksPath.
+# Existing hooks are refused: merge manually; no backups or overwrites.
+# Default hook is advisory, even on tool errors; --gate propagates esuna's status.
+# The hook runs this same review scope; it does not interpret remote push refs.
