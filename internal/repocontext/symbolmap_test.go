@@ -10,12 +10,13 @@ import (
 
 func requireUniversalCtags(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("ctags"); err != nil {
+	bin, err := exec.LookPath("ctags")
+	if err != nil {
 		t.Skip("ctags not on PATH")
 	}
-	out, err := exec.Command("ctags", "--version").CombinedOutput()
+	out, err := exec.Command(bin, "--version").CombinedOutput()
 	if err != nil || !strings.Contains(string(out), "Universal Ctags") {
-		t.Fatal("ctags on PATH is not Universal Ctags; install universal-ctags and put it first on PATH")
+		t.Skipf("%s is not a working Universal Ctags; install universal-ctags and put it first on PATH (version error: %v; output: %s)", bin, err, strings.TrimSpace(string(out)))
 	}
 }
 

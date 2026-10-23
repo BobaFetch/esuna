@@ -63,7 +63,11 @@ func TestBuildUsesRepoRootAndDeepFlag(t *testing.T) {
 			t.Fatal("deep build suppressed ctags failure")
 		}
 	})
+}
+
+func TestBuildDeepIncludesRepoWideSymbols(t *testing.T) {
 	requireUniversalCtags(t)
+	root := changedRepo(t)
 	put(t, root, "untouched.go", "package fixture\nfunc RepoWideSymbol() {}\n")
 	deep, err := Build(root, "HEAD", true)
 	if err != nil {
