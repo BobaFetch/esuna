@@ -317,7 +317,7 @@ install-hook flags:
 }
 
 func friendlyError(err error) string {
-	return friendlyErrorWithContext(err, "review")
+	return friendlyErrorWithContext(err, "complete the review")
 }
 
 func friendlyErrorWithContext(err error, context string) string {
@@ -336,7 +336,7 @@ func friendlyErrorWithContext(err error, context string) string {
 	case strings.Contains(message, "hook already exists") || strings.Contains(message, "pre-push hook already exists"):
 		return "A pre-push hook already exists; merge the desired commands into it manually, then retry if needed."
 	default:
-		return "esuna could not complete " + context + ": " + message + ". Check the repository and configuration, then retry."
+		return "esuna could not " + context + ": " + message + ". Check the repository and configuration, then retry."
 	}
 }
 
