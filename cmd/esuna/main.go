@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"esuna/internal/jev"
 )
 
 func main() {
@@ -39,6 +41,11 @@ func run(args []string, stderr io.Writer) int {
 		return 2
 	}
 
-	// Parse-only shell: downstream cards wire the review pipeline here.
+	if _, err := jev.NewClient(); err != nil {
+		fmt.Fprintln(stderr, err)
+		return 1
+	}
+
+	// Downstream cards wire the review pipeline here.
 	return 0
 }
