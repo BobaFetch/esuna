@@ -39,6 +39,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	chain := flags.Bool("chain", false, "run reviewers sequentially in configured pool order")
 	gate := flags.Bool("gate", false, "exit nonzero for confident P0 findings")
 	author := flags.String("author-model", "", "change author CLI (claude, codex, muse, grok); excluded from review")
+	reviewers := flags.String("reviewer", "", "override reviewer_pool for this run with comma-separated CLIs (claude, codex, muse, grok)")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -71,13 +72,20 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(err)
 	}
-	// Visit, rather than testing for a nonempty value, lets --author-model=""
-	// explicitly clear a configured author exclusion.
+	// Only explicitly supplied flags override repository settings. An empty
+	// --author-model clears the exclusion; an empty --reviewer is invalid.
 	flags.Visit(func(f *flag.Flag) {
 		if f.Name == "author-model" {
 			cfg.AuthorModel = *author
 		}
+		if f.Name == "reviewer" {
+			cfg.ReviewerPool, err = parseReviewerPool(*reviewers)
+		}
 	})
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
 	pool, err := configuredPool(cfg, stderr)
 	if err != nil {
 		return fail(err)
@@ -146,6 +154,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 var lookPath = exec.LookPath
 
+// Mirror .esuna.conf's reviewer_pool validation without changing config parsing.
+func parseReviewerPool(value string) ([]reviewer.Model, error) {
+	var pool []reviewer.Model
+	seen := make(map[reviewer.Model]bool)
+	for _, name := range strings.Split(value, ",") {
+		model := reviewer.Model(strings.TrimSpace(name))
+		switch model {
+		case reviewer.Claude, reviewer.Codex, reviewer.Muse, reviewer.Grok:
+			if !seen[model] {
+				seen[model] = true
+				pool = append(pool, model)
+				continue
+			}
+		}
+		return nil, fmt.Errorf("--reviewer must contain distinct models: claude, codex, muse, grok")
+	}
+	return pool, nil
+}
+
 // BuildPool owns author validation/exclusion. Filter available runners in config
 // order to respect both reviewer selection and the order of sequential chains.
 func configuredPool(cfg *config.Config, stderr io.Writer) ([]reviewer.Runner, error) {
@@ -169,7 +196,7 @@ func configuredPool(cfg *config.Config, stderr io.Writer) ([]reviewer.Runner, er
 		}
 	}
 	if len(pool) == 0 {
-		return nil, fmt.Errorf("reviewer pool is empty after excluding author %q and skipping missing CLIs; install a configured reviewer CLI or change reviewer_pool or author_model", cfg.AuthorModel)
+		return nil, fmt.Errorf("reviewer pool is empty after excluding author %q and skipping missing CLIs; install a selected reviewer CLI or change reviewer_pool, --reviewer, or author_model", cfg.AuthorModel)
 	}
 	return pool, nil
 }
@@ -312,6 +339,7 @@ Flags:`)
   -chain         run reviewers sequentially in configured pool order
   -gate          exit nonzero for confident P0 findings
   -author-model  change author CLI (claude, codex, muse, grok); excluded from review
+  -reviewer=<cli[,cli,...]>  override reviewer_pool for this run (claude, codex, muse, grok)
 
 Examples:
   esuna
@@ -337,7 +365,7 @@ func friendlyErrorWithContext(err error, context string) string {
 	case strings.Contains(message, "not found on PATH") || strings.Contains(message, "executable file not found"):
 		return "A required CLI is missing from PATH; install and log in to the configured reviewer CLIs, and install Universal Ctags if using --deep."
 	case strings.Contains(message, "reviewer pool is empty"):
-		return "Reviewer pool is empty after author exclusion and skipping missing CLIs; install a configured reviewer CLI, change reviewer_pool or author_model in .esuna.conf, or pass --author-model."
+		return "Reviewer pool is empty after author exclusion and skipping missing CLIs; install a selected reviewer CLI, change reviewer_pool or author_model in .esuna.conf, or pass --reviewer or --author-model."
 	case strings.Contains(message, ".esuna.conf line"):
 		return message + "; fix the indicated key=value line using .esuna.conf.example."
 	case strings.Contains(message, "legacy ctags") || strings.Contains(message, "must be Universal Ctags"):

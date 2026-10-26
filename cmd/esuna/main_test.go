@@ -182,6 +182,98 @@ func TestRunPipeline(t *testing.T) {
 	}
 }
 
+func TestRunReviewerOverride(t *testing.T) {
+	root := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		if out, err := exec.Command("git", append([]string{"-C", root}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s %v", args, out, err)
+		}
+	}
+	git("init")
+	git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "fixture")
+	if err := os.WriteFile(filepath.Join(root, "change.txt"), []byte("real test change\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "change.txt")
+	configText := "reviewer_pool=claude\n"
+	if err := os.WriteFile(filepath.Join(root, ".esuna.conf"), []byte(configText), 0600); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	log := filepath.Join(root, "invocations.log")
+	for _, name := range []string{"claude", "codex", "muse", "grok"} {
+		script := "#!/bin/sh\nwhile IFS= read -r line; do :; done\nprintf '%s\\n' '" + name + "' >> \"$ESUNA_TEST_INVOCATIONS\"\n"
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(script), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	t.Setenv("TYPESAFE_API_KEY", "test-only")
+	t.Setenv("ESUNA_TEST_INVOCATIONS", log)
+	t.Chdir(root)
+	oldLookup := lookPath
+	t.Cleanup(func() { lookPath = oldLookup })
+	for _, tc := range []struct {
+		name, invoked, lookedUp, missing, errorText string
+		args                                        []string
+		code                                        int
+	}{
+		{name: "override", args: []string{"--reviewer=codex"}, invoked: "codex\n", lookedUp: "codex"},
+		{name: "unset uses config", invoked: "claude\n", lookedUp: "claude"},
+		{name: "author excluded", args: []string{"--reviewer=claude,codex", "--author-model=claude"}, invoked: "codex\n", lookedUp: "codex"},
+		{name: "author empties pool", args: []string{"--reviewer=codex", "--author-model=codex"}, code: 1, errorText: "Reviewer pool is empty"},
+		{name: "invalid", args: []string{"--reviewer=invalid"}, code: 2, errorText: "--reviewer must contain distinct models: claude, codex, muse, grok"},
+		{name: "duplicate", args: []string{"--reviewer=codex,codex"}, code: 2, errorText: "--reviewer must contain distinct models: claude, codex, muse, grok"},
+		{name: "empty", args: []string{"--reviewer="}, code: 2, errorText: "--reviewer must contain distinct models"},
+		{name: "empty entry", args: []string{"--reviewer=codex,"}, code: 2, errorText: "--reviewer must contain distinct models"},
+		{name: "case sensitive", args: []string{"--reviewer=Codex"}, code: 2, errorText: "--reviewer must contain distinct models"},
+		{name: "trim and preserve chain order", args: []string{"--reviewer= grok , muse , codex , claude ", "--chain"}, invoked: "grok\nmuse\ncodex\nclaude\n", lookedUp: "grok,muse,codex,claude"},
+		{name: "skip missing", args: []string{"--reviewer=grok,codex"}, missing: "grok", invoked: "codex\n", lookedUp: "grok,codex"},
+		{name: "missing empties pool", args: []string{"--reviewer=codex"}, missing: "codex", lookedUp: "codex", code: 1, errorText: "Reviewer pool is empty"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(log, nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			var lookedUp []string
+			lookPath = func(name string) (string, error) {
+				lookedUp = append(lookedUp, name)
+				if name == tc.missing {
+					return "", &exec.Error{Name: name, Err: exec.ErrNotFound}
+				}
+				return exec.LookPath(name)
+			}
+			var stdout, stderr bytes.Buffer
+			if code := run(append([]string{"--json"}, tc.args...), &stdout, &stderr); code != tc.code {
+				t.Fatalf("exit %d, want %d, stdout %s, stderr %s", code, tc.code, &stdout, &stderr)
+			}
+			if got := strings.Join(lookedUp, ","); got != tc.lookedUp {
+				t.Fatalf("lookups: %q, want %q", got, tc.lookedUp)
+			}
+			invocations, err := os.ReadFile(log)
+			if err != nil || string(invocations) != tc.invoked {
+				t.Fatalf("invocations: %q, want %q, %v", invocations, tc.invoked, err)
+			}
+			wantStderr := ""
+			if tc.missing != "" {
+				wantStderr = "esuna: warning: \"" + tc.missing + "\" not found on PATH, skipping\n"
+			}
+			if tc.code == 0 {
+				if !strings.Contains(stdout.String(), `"findings":[]`) || stderr.String() != wantStderr {
+					t.Fatalf("stdout %s, stderr %s", &stdout, &stderr)
+				}
+			} else if stdout.Len() != 0 || !strings.Contains(stderr.String(), tc.errorText) || !strings.HasPrefix(stderr.String(), wantStderr) {
+				t.Fatalf("stdout %s, stderr %s, want error %q", &stdout, &stderr, tc.errorText)
+			}
+			contents, err := os.ReadFile(filepath.Join(root, ".esuna.conf"))
+			if err != nil || string(contents) != configText {
+				t.Fatalf("config changed: %q, %v", contents, err)
+			}
+		})
+	}
+}
+
 func TestConfiguredPoolOrder(t *testing.T) {
 	old := lookPath
 	lookPath = func(name string) (string, error) { return "/fixture/" + name, nil }
@@ -344,6 +436,9 @@ func TestRunHelpAndMissingKey(t *testing.T) {
 	var out, errs bytes.Buffer
 	if code := run([]string{"--help"}, &out, &errs); code != 0 {
 		t.Fatalf("help: %d %s", code, &errs)
+	}
+	if !strings.Contains(errs.String(), "-reviewer=<cli[,cli,...]>") || !strings.Contains(errs.String(), "override reviewer_pool for this run") {
+		t.Fatalf("help missing reviewer flag: %s", &errs)
 	}
 	errs.Reset()
 	if code := run([]string{"--json"}, &out, &errs); code != 1 || !strings.Contains(errs.String(), "TYPESAFE_API_KEY") || out.Len() != 0 {
