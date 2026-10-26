@@ -152,16 +152,113 @@ func TestRunPipeline(t *testing.T) {
 	if code := run([]string{"--json", "--author-model="}, &out, &errs); code != 1 || out.Len() != 0 || !strings.Contains(errs.String(), "claude reviewer") {
 		t.Fatalf("reviewer failure: %d %s %s", code, &out, &errs)
 	}
+
+	// A missing configured CLI must not prevent the remaining reviewer running.
+	write(".esuna.conf", "reviewer_pool=grok,claude\n", 0600)
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte("#!/bin/sh\nprintf 'ran\\n' >> \"$ESUNA_TEST_PROMPTS\"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	oldLookup := lookPath
+	lookPath = func(name string) (string, error) {
+		if name == "grok" {
+			return "", &exec.Error{Name: name, Err: exec.ErrNotFound}
+		}
+		return exec.LookPath(name)
+	}
+	t.Cleanup(func() { lookPath = oldLookup })
+	for _, mode := range []string{"--merge", "--chain"} {
+		out.Reset()
+		errs.Reset()
+		if code := run([]string{"--json", mode}, &out, &errs); code != 0 {
+			t.Fatalf("partial pool %s: exit %d, stdout %s, stderr %s", mode, code, &out, &errs)
+		}
+		if errs.String() != "esuna: warning: \"grok\" not found on PATH, skipping\n" || !strings.Contains(out.String(), `"findings":[]`) {
+			t.Fatalf("partial pool %s: stdout %s, stderr %s", mode, &out, &errs)
+		}
+	}
+	prompts, err = os.ReadFile(log)
+	if err != nil || strings.Count(string(prompts), "ran\n") != 2 {
+		t.Fatalf("remaining reviewer did not run twice: %s, %v", prompts, err)
+	}
 }
 
 func TestConfiguredPoolOrder(t *testing.T) {
+	old := lookPath
+	lookPath = func(name string) (string, error) { return "/fixture/" + name, nil }
+	t.Cleanup(func() { lookPath = old })
 	cfg := &config.Config{ReviewerPool: []reviewer.Model{reviewer.Grok, reviewer.Claude, reviewer.Codex}, AuthorModel: "claude"}
-	pool, err := configuredPool(cfg)
+	pool, err := configuredPool(cfg, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(pool) != 2 || pool[0].Model() != reviewer.Grok || pool[1].Model() != reviewer.Codex {
 		t.Fatalf("pool: %v", pool)
+	}
+}
+
+func TestConfiguredPoolSkipsMissingCLI(t *testing.T) {
+	old := lookPath
+	lookPath = func(name string) (string, error) {
+		if name == "grok" {
+			return "", &exec.Error{Name: name, Err: exec.ErrNotFound}
+		}
+		return "/fixture/" + name, nil
+	}
+	t.Cleanup(func() { lookPath = old })
+	cfg := &config.Config{ReviewerPool: []reviewer.Model{reviewer.Grok, reviewer.Muse, reviewer.Claude}}
+	var stderr bytes.Buffer
+	pool, err := configuredPool(cfg, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pool) != 2 || pool[0].Model() != reviewer.Muse || pool[1].Model() != reviewer.Claude {
+		t.Fatalf("pool: %v", pool)
+	}
+	if got, want := stderr.String(), "esuna: warning: \"grok\" not found on PATH, skipping\n"; got != want {
+		t.Fatalf("warning: got %q, want %q", got, want)
+	}
+}
+
+func TestRunMissingReviewersFailsLoudly(t *testing.T) {
+	root := t.TempDir()
+	if out, err := exec.Command("git", "init", root).CombinedOutput(); err != nil {
+		t.Fatalf("init: %s %v", out, err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".esuna.conf"), []byte("reviewer_pool=claude,grok\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(root)
+	t.Setenv("TYPESAFE_API_KEY", "test-only")
+	old := lookPath
+	t.Cleanup(func() { lookPath = old })
+	for _, author := range []string{"", "claude"} {
+		t.Run("author="+author, func(t *testing.T) {
+			var lookedUp []string
+			lookPath = func(name string) (string, error) {
+				lookedUp = append(lookedUp, name)
+				return "", &exec.Error{Name: name, Err: exec.ErrNotFound}
+			}
+			var stdout, stderr bytes.Buffer
+			code := run([]string{"--json", "--author-model=" + author}, &stdout, &stderr)
+			if code != 1 || stdout.Len() != 0 {
+				t.Fatalf("exit %d, stdout %s, stderr %s", code, &stdout, &stderr)
+			}
+			if !strings.Contains(stderr.String(), "Reviewer pool is empty") || !strings.Contains(stderr.String(), "skipping missing CLIs") {
+				t.Fatalf("missing clear empty-pool error: %s", &stderr)
+			}
+			wantLookups := "claude,grok"
+			if author == "claude" {
+				wantLookups = "grok"
+			}
+			if strings.Join(lookedUp, ",") != wantLookups {
+				t.Fatalf("lookups %v, want %s", lookedUp, wantLookups)
+			}
+			for _, name := range lookedUp {
+				if !strings.Contains(stderr.String(), "esuna: warning: \""+name+"\" not found on PATH, skipping\n") {
+					t.Fatalf("missing warning for %s: %s", name, &stderr)
+				}
+			}
+		})
 	}
 }
 

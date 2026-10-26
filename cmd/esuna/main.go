@@ -78,7 +78,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			cfg.AuthorModel = *author
 		}
 	})
-	pool, err := configuredPool(cfg)
+	pool, err := configuredPool(cfg, stderr)
 	if err != nil {
 		return fail(err)
 	}
@@ -144,9 +144,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return runGate(result, cfg.GateThreshold, *gate)
 }
 
-// BuildPool owns author validation/exclusion. Filter its runners in config order
-// to respect both reviewer selection and the order of sequential chains.
-func configuredPool(cfg *config.Config) ([]reviewer.Runner, error) {
+var lookPath = exec.LookPath
+
+// BuildPool owns author validation/exclusion. Filter available runners in config
+// order to respect both reviewer selection and the order of sequential chains.
+func configuredPool(cfg *config.Config, stderr io.Writer) ([]reviewer.Runner, error) {
 	all, err := reviewer.BuildPool(reviewer.Model(cfg.AuthorModel))
 	if err != nil {
 		return nil, err
@@ -155,12 +157,19 @@ func configuredPool(cfg *config.Config) ([]reviewer.Runner, error) {
 	for _, model := range cfg.ReviewerPool {
 		for _, runner := range all {
 			if runner.Model() == model {
+				if _, err := lookPath(string(model)); err != nil {
+					if !errors.Is(err, exec.ErrNotFound) {
+						return nil, fmt.Errorf("locate %q reviewer: %w", model, err)
+					}
+					fmt.Fprintf(stderr, "esuna: warning: %q not found on PATH, skipping\n", model)
+					continue
+				}
 				pool = append(pool, runner)
 			}
 		}
 	}
 	if len(pool) == 0 {
-		return nil, fmt.Errorf("reviewer pool is empty after excluding author %q; change reviewer_pool or author_model", cfg.AuthorModel)
+		return nil, fmt.Errorf("reviewer pool is empty after excluding author %q and skipping missing CLIs; install a configured reviewer CLI or change reviewer_pool or author_model", cfg.AuthorModel)
 	}
 	return pool, nil
 }
@@ -328,7 +337,7 @@ func friendlyErrorWithContext(err error, context string) string {
 	case strings.Contains(message, "not found on PATH") || strings.Contains(message, "executable file not found"):
 		return "A required CLI is missing from PATH; install and log in to the configured reviewer CLIs, and install Universal Ctags if using --deep."
 	case strings.Contains(message, "reviewer pool is empty"):
-		return "Reviewer pool is empty after author exclusion; change reviewer_pool or author_model in .esuna.conf, or pass --author-model."
+		return "Reviewer pool is empty after author exclusion and skipping missing CLIs; install a configured reviewer CLI, change reviewer_pool or author_model in .esuna.conf, or pass --author-model."
 	case strings.Contains(message, ".esuna.conf line"):
 		return message + "; fix the indicated key=value line using .esuna.conf.example."
 	case strings.Contains(message, "legacy ctags") || strings.Contains(message, "must be Universal Ctags"):
