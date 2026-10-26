@@ -36,6 +36,8 @@ Copy [`.esuna.conf.example`](.esuna.conf.example) to `.esuna.conf` at the reposi
 
 Copy [`.esuna/guidelines.md.example`](.esuna/guidelines.md.example) to `.esuna/guidelines.md` to provide repository-specific reviewer guidance. These files are optional.
 
+For agent-facing push guidance, see [`docs/AGENTS.md.snippet`](docs/AGENTS.md.snippet).
+
 ## Confidence scoring
 
 Jev/TypeSafe scores each reported finding's confidence as a probability from 0 to 1; the result's overall confidence is the arithmetic mean, or 1.0 when there are no findings. The declared author model is excluded from the reviewer pool to reduce self-review; reviewers may be selected and ordered in `.esuna.conf`. Scoring requires `TYPESAFE_API_KEY` and esuna does not skip scoring when it is unavailable.

@@ -1,0 +1,9 @@
+## Code review before pushing
+
+Before every `git push`, run:
+
+    esuna --author-model=<your-cli-name>
+
+`--author-model` excludes your own CLI from reviewing your own change. Fix every real P0, P1, and P2 finding before pushing — do not push with known findings outstanding. Include a one-line summary of the esuna review in the PR body (e.g. "esuna: 2 P1 findings fixed, 0 outstanding").
+
+Setup (once per repo, not per push): commit a `.esuna.conf` at the repo root with `reviewer_pool` trimmed to the CLIs you actually want reviewing (default is all four — trimming saves quota). Optionally add `.esuna/guidelines.md` for repo-specific review rules. See the [esuna README](https://github.com/BobaFetch/esuna) for full setup.
