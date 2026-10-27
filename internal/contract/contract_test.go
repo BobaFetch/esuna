@@ -36,7 +36,7 @@ func TestResultJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = `{"summary":"One finding","overall_confidence":0.85,"findings":[{"file":"main.go","line":12,"severity":"P0","message":"Handle the error","confidence":0.9}]}`
+	const want = `{"summary":"One finding","overall_confidence":0.85,"findings":[{"file":"main.go","line":12,"severity":"P0","message":"Handle the error","confidence":0.9}],"files_reviewed":0,"base":""}`
 	if string(got) != want {
 		t.Fatalf("Result JSON = %s; want %s", got, want)
 	}

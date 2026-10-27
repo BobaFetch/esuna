@@ -20,4 +20,6 @@ type Result struct {
 	Summary           string    `json:"summary"`
 	OverallConfidence float64   `json:"overall_confidence"`
 	Findings          []Finding `json:"findings"`
+	FilesReviewed     int       `json:"files_reviewed"`
+	Base              string    `json:"base"`
 }
