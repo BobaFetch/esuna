@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -125,17 +126,21 @@ func TestRunPipeline(t *testing.T) {
 
 	// Exercise the real run with synthetic reviewer findings and HTTP fixtures.
 	for _, tc := range []struct {
-		name      string
-		findings  []contract.Finding
-		status    int
-		wantFiles string
-		wantCalls int
-		wantCode  int
-		warning   string
-		reason    string
+		name         string
+		findings     []contract.Finding
+		status       int
+		transportErr error
+		wantFiles    string
+		wantCalls    int
+		wantCode     int
+		warning      string
+		reason       string
 	}{
 		{name: "missing file keeps other findings", findings: []contract.Finding{{File: "code.go", Line: 1}, {File: "missing.go", Line: 7}, {File: "code.go", Line: 2}}, wantFiles: "code.go,code.go", wantCalls: 2, warning: "missing.go:7"},
 		{name: "single score failure keeps others", findings: []contract.Finding{{File: "code.go", Line: 1}, {File: "code.go", Line: 2}}, status: 422, wantFiles: "code.go", wantCalls: 2, warning: "code.go:1"},
+		{name: "bad input keeps others", findings: []contract.Finding{{File: "code.go", Line: 1}, {File: "code.go", Line: 2}}, status: 400, wantFiles: "code.go", wantCalls: 2, warning: "code.go:1"},
+		{name: "oversized input keeps others", findings: []contract.Finding{{File: "code.go", Line: 1}, {File: "code.go", Line: 2}}, status: 413, wantFiles: "code.go", wantCalls: 2, warning: "code.go:1"},
+		{name: "transport error fails fast", findings: []contract.Finding{{File: "code.go", Line: 1}, {File: "code.go", Line: 2}}, transportErr: errors.New("dial tcp: connect: connection refused"), wantCalls: 1, wantCode: 1},
 		{name: "file read error keeps others", findings: []contract.Finding{{File: ".esuna", Line: 7}, {File: "code.go", Line: 2}}, wantFiles: "code.go", wantCalls: 1, warning: ".esuna:7", reason: "is a directory"},
 		{name: "quota fails fast", findings: []contract.Finding{{File: "code.go", Line: 1}, {File: "code.go", Line: 2}}, status: 429, wantCalls: 1, wantCode: 1},
 		{name: "all file reads skipped", findings: []contract.Finding{{File: "missing.go", Line: 7}}, warning: "missing.go:7"},
@@ -162,6 +167,9 @@ func TestRunPipeline(t *testing.T) {
 			calls := 0
 			http.DefaultTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				calls++
+				if tc.transportErr != nil {
+					return nil, tc.transportErr
+				}
 				status := http.StatusOK
 				body := `{"answers":{"true_positive":{"type":"noul","noul":0.8}}}`
 				if calls == 1 && tc.status != 0 {
@@ -175,9 +183,17 @@ func TestRunPipeline(t *testing.T) {
 				t.Fatalf("exit %d, calls %d; stdout %s; stderr %s", code, calls, &stdout, &stderr)
 			}
 			if tc.wantCode != 0 {
-				if stdout.Len() != 0 || !strings.Contains(stderr.String(), fmt.Sprintf("HTTP %d", tc.status)) {
+				reason := fmt.Sprintf("HTTP %d", tc.status)
+				if tc.transportErr != nil {
+					reason = "TypeSafe scoring request:"
+					if !strings.Contains(stderr.String(), tc.transportErr.Error()) {
+						t.Fatalf("missing transport error: %s", &stderr)
+					}
+				}
+				if stdout.Len() != 0 || !strings.Contains(stderr.String(), reason) || strings.Contains(stderr.String(), "skipping") {
 					t.Fatalf("fatal error: stdout %s, stderr %s", &stdout, &stderr)
 				}
+				t.Logf("synthetic run exit=%d, scoring calls=%d\nstdout: %sstderr: %s", code, calls, &stdout, &stderr)
 				return
 			}
 			var result contract.Result

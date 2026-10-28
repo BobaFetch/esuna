@@ -144,7 +144,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			// the whole client. Only input-specific HTTP failures can be skipped.
 			var status int
 			fmt.Sscanf(err.Error(), "TypeSafe scoring returned HTTP %d", &status)
-			if ctx.Err() != nil || (status != 0 && status != 400 && status != 413 && status != 422) {
+			if ctx.Err() != nil || (status != 400 && status != 413 && status != 422) {
 				return fail(err)
 			}
 			fmt.Fprintf(stderr, "esuna: warning: %s:%d: score finding: %v; skipping finding\n", finding.File, finding.Line, err)
