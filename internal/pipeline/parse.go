@@ -28,6 +28,9 @@ func ParseReviewerOutput(raw string) ([]contract.Finding, error) {
 		for i := range fields {
 			fields[i] = strings.TrimSpace(fields[i])
 		}
+		if len(fields[0]) > 255 || strings.ContainsAny(fields[0], "\n\r	") || strings.Contains(fields[0], "  ") {
+			continue
+		}
 		n, err := strconv.Atoi(fields[1])
 		if err != nil || n <= 0 || !filepath.IsLocal(fields[0]) || !contract.ValidSeverity(fields[2]) || fields[3] == "" {
 			continue

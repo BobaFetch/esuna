@@ -148,21 +148,37 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	files := make(map[string]bool)
 	confidence := 0.0
-	for i := range findings {
-		finding := &findings[i]
+	scored := findings[:0]
+	for _, finding := range findings {
 		// Re-read even findings outside the touched files, safely within the root.
 		contents, err := repocontext.FullContent(root, []string{finding.File})
+		// FullContent omits deleted/missing files rather than returning an error.
+		if _, exists := contents[finding.File]; err == nil && !exists {
+			err = os.ErrNotExist
+		}
 		if err != nil {
-			return fail(err)
+			fmt.Fprintf(stderr, "esuna: warning: %s:%d: read file: %v; skipping finding\n", finding.File, finding.Line, err)
+			continue
 		}
 		text := fmt.Sprintf("%s|%d|%s|%s", finding.File, finding.Line, finding.Severity, finding.Message)
 		finding.Confidence, err = client.ScoreFinding(ctx, text, bundle.Diff, contents[finding.File])
 		if err != nil {
-			return fail(err)
+			// jev's HTTP error type is private. Read its status prefix, not the
+			// response body: auth, quota, endpoint and service failures affect
+			// the whole client. Only input-specific HTTP failures can be skipped.
+			var status int
+			fmt.Sscanf(err.Error(), "TypeSafe scoring returned HTTP %d", &status)
+			if ctx.Err() != nil || (status != 400 && status != 413 && status != 422) {
+				return fail(err)
+			}
+			fmt.Fprintf(stderr, "esuna: warning: %s:%d: score finding: %v; skipping finding\n", finding.File, finding.Line, err)
+			continue
 		}
+		scored = append(scored, finding)
 		confidence += finding.Confidence
 		files[finding.File] = true
 	}
+	findings = scored
 	// Overall confidence is the arithmetic mean; an empty review is 1.0.
 	if len(findings) == 0 {
 		confidence = 1

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -123,7 +124,114 @@ func TestRunPipeline(t *testing.T) {
 		t.Fatalf("config author exclusion: %d %s %s", code, &out, &errs)
 	}
 
-	// Scoring failure must not become a zero-confidence successful report.
+	// Exercise the real run with synthetic reviewer findings and HTTP fixtures.
+	for _, tc := range []struct {
+		name         string
+		findings     []contract.Finding
+		status       int
+		transportErr error
+		wantFiles    string
+		wantCalls    int
+		wantCode     int
+		warning      string
+		reason       string
+	}{
+		{name: "missing file keeps other findings", findings: []contract.Finding{{File: "code.go", Line: 1}, {File: "missing.go", Line: 7}, {File: "code.go", Line: 2}}, wantFiles: "code.go,code.go", wantCalls: 2, warning: "missing.go:7"},
+		{name: "single score failure keeps others", findings: []contract.Finding{{File: "code.go", Line: 1}, {File: "code.go", Line: 2}}, status: 422, wantFiles: "code.go", wantCalls: 2, warning: "code.go:1"},
+		{name: "bad input keeps others", findings: []contract.Finding{{File: "code.go", Line: 1}, {File: "code.go", Line: 2}}, status: 400, wantFiles: "code.go", wantCalls: 2, warning: "code.go:1"},
+		{name: "oversized input keeps others", findings: []contract.Finding{{File: "code.go", Line: 1}, {File: "code.go", Line: 2}}, status: 413, wantFiles: "code.go", wantCalls: 2, warning: "code.go:1"},
+		{name: "transport error fails fast", findings: []contract.Finding{{File: "code.go", Line: 1}, {File: "code.go", Line: 2}}, transportErr: errors.New("dial tcp: connect: connection refused"), wantCalls: 1, wantCode: 1},
+		{name: "file read error keeps others", findings: []contract.Finding{{File: ".esuna", Line: 7}, {File: "code.go", Line: 2}}, wantFiles: "code.go", wantCalls: 1, warning: ".esuna:7", reason: "is a directory"},
+		{name: "quota fails fast", findings: []contract.Finding{{File: "code.go", Line: 1}, {File: "code.go", Line: 2}}, status: 429, wantCalls: 1, wantCode: 1},
+		{name: "all file reads skipped", findings: []contract.Finding{{File: "missing.go", Line: 7}}, warning: "missing.go:7"},
+		{name: "all scores skipped", findings: []contract.Finding{{File: "code.go", Line: 1}}, status: 422, wantCalls: 1, warning: "code.go:1"},
+		{name: "auth fails fast", findings: []contract.Finding{{File: "code.go", Line: 1}, {File: "code.go", Line: 2}}, status: 401, wantCalls: 1, wantCode: 1},
+		{name: "forbidden fails fast", findings: []contract.Finding{{File: "code.go", Line: 1}, {File: "code.go", Line: 2}}, status: 403, wantCalls: 1, wantCode: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var raw strings.Builder
+			for _, finding := range tc.findings {
+				fmt.Fprintf(&raw, "%s|%d|P1|Synthetic defect at line %d\n", finding.File, finding.Line, finding.Line)
+			}
+			t.Setenv("ESUNA_TEST_FINDINGS", raw.String())
+			if err := os.WriteFile(filepath.Join(bin, "claude"), []byte("#!/bin/sh\nprintf '%s' \"$ESUNA_TEST_FINDINGS\"\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := os.WriteFile(filepath.Join(bin, "claude"), []byte(script), 0700); err != nil {
+					t.Error(err)
+				}
+			}()
+			transport := http.DefaultTransport
+			defer func() { http.DefaultTransport = transport }()
+			calls := 0
+			http.DefaultTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				if tc.transportErr != nil {
+					return nil, tc.transportErr
+				}
+				status := http.StatusOK
+				body := `{"answers":{"true_positive":{"type":"noul","noul":0.8}}}`
+				if calls == 1 && tc.status != 0 {
+					status, body = tc.status, "synthetic scoring failure"
+				}
+				return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+			})
+			var stdout, stderr bytes.Buffer
+			code := run([]string{"--json", "--author-model="}, &stdout, &stderr)
+			if code != tc.wantCode || calls != tc.wantCalls {
+				t.Fatalf("exit %d, calls %d; stdout %s; stderr %s", code, calls, &stdout, &stderr)
+			}
+			if tc.wantCode != 0 {
+				reason := fmt.Sprintf("HTTP %d", tc.status)
+				if tc.transportErr != nil {
+					reason = "TypeSafe scoring request:"
+					if !strings.Contains(stderr.String(), tc.transportErr.Error()) {
+						t.Fatalf("missing transport error: %s", &stderr)
+					}
+				}
+				if stdout.Len() != 0 || !strings.Contains(stderr.String(), reason) || strings.Contains(stderr.String(), "skipping") {
+					t.Fatalf("fatal error: stdout %s, stderr %s", &stdout, &stderr)
+				}
+				t.Logf("synthetic run exit=%d, scoring calls=%d\nstdout: %sstderr: %s", code, calls, &stdout, &stderr)
+				return
+			}
+			var result contract.Result
+			if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
+			var files []string
+			for _, f := range result.Findings {
+				files = append(files, f.File)
+				if f.Confidence != 0.8 {
+					t.Fatalf("unscored finding: %+v", f)
+				}
+			}
+			wantConfidence := 0.8
+			if tc.wantFiles == "" {
+				wantConfidence = 1
+			}
+			if strings.Join(files, ",") != tc.wantFiles || result.OverallConfidence != wantConfidence || result.Findings == nil {
+				t.Fatalf("result: %+v", result)
+			}
+			if !strings.Contains(stderr.String(), "esuna: warning:") || !strings.Contains(stderr.String(), tc.warning) || !strings.Contains(stderr.String(), "skipping") {
+				t.Fatalf("missing warning: %s", &stderr)
+			}
+			reason := tc.reason
+			if reason == "" {
+				reason = "file does not exist"
+			}
+			if tc.status != 0 {
+				reason = fmt.Sprintf("HTTP %d", tc.status)
+			}
+			if !strings.Contains(stderr.String(), reason) {
+				t.Fatalf("missing warning reason: %s", &stderr)
+			}
+			t.Logf("synthetic run exit=%d\nstdout: %sstderr: %s", code, &stdout, &stderr)
+		})
+	}
+
+	// A service-wide scoring failure must still abort, not produce a successful report.
 	http.DefaultTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 503, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
 	})
