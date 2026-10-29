@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -30,7 +31,7 @@ func TestRunPipeline(t *testing.T) {
 			t.Fatalf("git %v: %s %v", args, out, err)
 		}
 	}
-	git("init")
+	git("init", "-b", "feature")
 	git("config", "user.name", "Test")
 	git("config", "user.email", "test@example.invalid")
 	git("config", "commit.gpgsign", "false")
@@ -95,7 +96,7 @@ func TestRunPipeline(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			code := run(tc.args, &stdout, &stderr)
-			if code != tc.code || stderr.Len() != 0 {
+			if code != tc.code || stderr.String() != "reviewing 1 files, +1/-1, base HEAD..HEAD\n" {
 				t.Fatalf("exit %d, stderr %s, stdout %s", code, &stderr, &stdout)
 			}
 			var result contract.Result
@@ -137,7 +138,7 @@ func TestRunPipeline(t *testing.T) {
 	}
 	out.Reset()
 	errs.Reset()
-	if code := run([]string{"--json", "--gate", "--author-model="}, &out, &errs); code != 0 || errs.Len() != 0 {
+	if code := run([]string{"--json", "--gate", "--author-model="}, &out, &errs); code != 0 || errs.String() != "reviewing 1 files, +1/-1, base HEAD..HEAD\n" {
 		t.Fatalf("empty review: %d %s %s", code, &out, &errs)
 	}
 	if !strings.Contains(out.String(), `"overall_confidence":1`) || !strings.Contains(out.String(), `"findings":[]`) {
@@ -172,7 +173,7 @@ func TestRunPipeline(t *testing.T) {
 		if code := run([]string{"--json", mode}, &out, &errs); code != 0 {
 			t.Fatalf("partial pool %s: exit %d, stdout %s, stderr %s", mode, code, &out, &errs)
 		}
-		if errs.String() != "esuna: warning: \"grok\" not found on PATH, skipping\n" || !strings.Contains(out.String(), `"findings":[]`) {
+		if errs.String() != "esuna: warning: \"grok\" not found on PATH, skipping\nreviewing 1 files, +1/-1, base HEAD..HEAD\n" || !strings.Contains(out.String(), `"findings":[]`) {
 			t.Fatalf("partial pool %s: stdout %s, stderr %s", mode, &out, &errs)
 		}
 	}
@@ -190,12 +191,12 @@ func TestRunReviewerOverride(t *testing.T) {
 			t.Fatalf("git %v: %s %v", args, out, err)
 		}
 	}
-	git("init")
+	git("init", "-b", "feature")
 	git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "fixture")
-	if err := os.WriteFile(filepath.Join(root, "change.txt"), []byte("real test change\n"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "change.go"), []byte("package fixture\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	git("add", "change.txt")
+	git("add", "change.go")
 	configText := "reviewer_pool=claude\n"
 	if err := os.WriteFile(filepath.Join(root, ".esuna.conf"), []byte(configText), 0600); err != nil {
 		t.Fatal(err)
@@ -260,7 +261,7 @@ func TestRunReviewerOverride(t *testing.T) {
 				wantStderr = "esuna: warning: \"" + tc.missing + "\" not found on PATH, skipping\n"
 			}
 			if tc.code == 0 {
-				if !strings.Contains(stdout.String(), `"findings":[]`) || stderr.String() != wantStderr {
+				if !strings.Contains(stdout.String(), `"findings":[]`) || stderr.String() != wantStderr+"reviewing 1 files, +1/-0, base HEAD..HEAD\n" {
 					t.Fatalf("stdout %s, stderr %s", &stdout, &stderr)
 				}
 			} else if stdout.Len() != 0 || !strings.Contains(stderr.String(), tc.errorText) || !strings.HasPrefix(stderr.String(), wantStderr) {
@@ -394,7 +395,7 @@ func TestReviewBaseIncludesCommittedChanges(t *testing.T) {
 		}
 		return strings.TrimSpace(string(out))
 	}
-	git("init")
+	git("init", "-b", "feature")
 	git("config", "user.name", "Test")
 	git("config", "user.email", "test@example.invalid")
 	git("config", "commit.gpgsign", "false")
@@ -412,6 +413,260 @@ func TestReviewBaseIncludesCommittedChanges(t *testing.T) {
 	git("branch", "--set-upstream-to=upstream-fixture")
 	if got := reviewBase(root); got != initial {
 		t.Fatalf("upstream base: %s want %s", got, initial)
+	}
+}
+
+func TestReviewBaseCandidateOrder(t *testing.T) {
+	for _, refs := range [][]string{
+		{"origin/main", "origin/master", "main", "master"},
+		{"origin/master", "main", "master"}, {"main", "master"}, {"master"}, {},
+	} {
+		t.Run(strings.Join(refs, ","), func(t *testing.T) {
+			root := t.TempDir()
+			git := func(args ...string) string {
+				t.Helper()
+				out, err := exec.Command("git", append([]string{"-C", root}, args...)...).CombinedOutput()
+				if err != nil {
+					t.Fatalf("git %v: %s %v", args, out, err)
+				}
+				return strings.TrimSpace(string(out))
+			}
+			git("init", "-b", "feature")
+			git("config", "user.name", "Test")
+			git("config", "user.email", "test@example.invalid")
+			git("config", "commit.gpgsign", "false")
+			git("commit", "--allow-empty", "-m", "initial")
+			if got := reviewBase(root); got != "HEAD" {
+				t.Fatalf("initial: %s", got)
+			}
+			want := git("rev-parse", "HEAD")
+			for i, ref := range refs {
+				name := "refs/heads/" + ref
+				if strings.HasPrefix(ref, "origin/") {
+					name = "refs/remotes/" + ref
+				}
+				diverged := git("commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "diverged mainline")
+				git("update-ref", name, diverged)
+				git("commit", "--allow-empty", "-m", "candidate")
+				if i == len(refs)-1 {
+					git("branch", "tracking")
+				}
+			}
+			git("commit", "--allow-empty", "-m", "second")
+			previous := git("rev-parse", "HEAD")
+			git("commit", "--allow-empty", "-m", "third")
+			if len(refs) == 0 {
+				want = previous
+			}
+			if got := reviewBase(root); got != want {
+				t.Fatalf("base %s, want %s", got, want)
+			}
+			if len(refs) > 0 {
+				git("branch", "--set-upstream-to=tracking")
+				want = git("rev-parse", "tracking")
+				if got := reviewBase(root); got != want {
+					t.Fatalf("upstream %s, want %s", got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestRunBaseAndReviewHeader(t *testing.T) {
+	root := t.TempDir()
+	git := func(args ...string) string {
+		t.Helper()
+		out, err := exec.Command("git", append([]string{"-C", root}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %s %v", args, out, err)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git("init", "-b", "main")
+	git("config", "user.name", "Test")
+	git("config", "user.email", "test@example.invalid")
+	git("config", "commit.gpgsign", "false")
+	git("commit", "--allow-empty", "-m", "initial")
+	initial := git("rev-parse", "HEAD")
+	git("switch", "-c", "feature")
+	for _, name := range []string{"one.go", "two.go", "three.go"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("package fixture\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		git("add", name)
+		git("commit", "-m", name)
+	}
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte("#!/bin/sh\ncat > \"$ESUNA_TEST_PROMPTS\"\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	log := filepath.Join(bin, "prompt")
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+	t.Setenv("TYPESAFE_API_KEY", "test-only")
+	t.Setenv("ESUNA_TEST_PROMPTS", log)
+	t.Chdir(root)
+	for _, tc := range []struct {
+		base, wantBase string
+		count          int
+	}{
+		{"", initial, 3}, {"main", "main", 3}, {"HEAD^", "HEAD^", 1}, {"HEAD~2", "HEAD~2", 2},
+	} {
+		for _, jsonOutput := range []bool{true, false} {
+			args := []string{"--reviewer=claude"}
+			if tc.base != "" {
+				args = append(args, "--base", tc.base)
+			}
+			if jsonOutput {
+				args = append(args, "--json")
+			}
+			var out, errs bytes.Buffer
+			if code := run(args, &out, &errs); code != 0 {
+				t.Fatalf("exit %d, stdout %s, stderr %s", code, &out, &errs)
+			}
+			wantHeader := fmt.Sprintf("reviewing %d files, +%d/-0, base %s..HEAD\n", tc.count, tc.count, tc.wantBase)
+			if errs.String() != wantHeader {
+				t.Fatalf("header %q, want %q", errs.String(), wantHeader)
+			}
+			if jsonOutput {
+				var result map[string]any
+				if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+					t.Fatal(err)
+				}
+				if result["base"] != tc.wantBase || result["files_reviewed"] != float64(tc.count) {
+					t.Fatalf("metadata: %s", &out)
+				}
+			} else if !strings.Contains(out.String(), "0 findings across 0 files (overall confidence 1.00)") {
+				t.Fatalf("human output: %s", &out)
+			}
+			prompt, err := os.ReadFile(log)
+			if err != nil || strings.Count(string(prompt), "diff --git") != tc.count {
+				t.Fatalf("prompt %s, %v", prompt, err)
+			}
+		}
+	}
+	// A resolving but unrelated mainline must never trigger HEAD^ fallback.
+	unrelated := git("commit-tree", "HEAD^{tree}", "-m", "unrelated history")
+	git("update-ref", "refs/remotes/origin/main", unrelated)
+	if got := reviewBase(root); got != "" {
+		t.Fatalf("unrelated mainline silently fell back to %s", got)
+	}
+	var out, errs bytes.Buffer
+	if code := run([]string{"--json", "--reviewer=claude"}, &out, &errs); code != 1 || out.Len() != 0 || !strings.Contains(errs.String(), "could not find a merge-base") {
+		t.Fatalf("unrelated mainline: exit %d, stdout %s, stderr %s", code, &out, &errs)
+	}
+	out.Reset()
+	errs.Reset()
+	if code := run([]string{"--json", "--reviewer=claude", "--base=HEAD^"}, &out, &errs); code != 0 || !strings.Contains(out.String(), `"base":"HEAD^"`) {
+		t.Fatalf("explicit base did not bypass resolution: exit %d, stdout %s, stderr %s", code, &out, &errs)
+	}
+}
+
+func TestRunDiffPreflight(t *testing.T) {
+	for _, name := range []string{"", "README.md", "nested/ReAdMe", "LICENSE", "notes.RST", "notes.TXT", "Makefile", "Dockerfile", "docs/setup.go", "config.yaml"} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			git := func(args ...string) {
+				t.Helper()
+				if out, err := exec.Command("git", append([]string{"-C", root}, args...)...).CombinedOutput(); err != nil {
+					t.Fatalf("git: %s %v", out, err)
+				}
+			}
+			git("init", "-b", "feature")
+			git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "initial")
+			if name != "" {
+				path := filepath.Join(root, name)
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("fixture\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				git("add", name)
+			}
+			bin := t.TempDir()
+			log := filepath.Join(bin, "calls")
+			if err := os.WriteFile(filepath.Join(bin, "claude"), []byte("#!/bin/sh\nprintf called >> \"$ESUNA_TEST_INVOCATIONS\"\nexit 9\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+			t.Setenv("ESUNA_TEST_INVOCATIONS", log)
+			t.Setenv("TYPESAFE_API_KEY", "test-only")
+			t.Chdir(root)
+			old := http.DefaultTransport
+			http.DefaultTransport = roundTripFunc(func(*http.Request) (*http.Response, error) { t.Fatal("unexpected Jev call"); return nil, nil })
+			t.Cleanup(func() { http.DefaultTransport = old })
+			for _, gate := range []bool{false, true} {
+				args := []string{"--json", "--reviewer=claude"}
+				if gate {
+					args = append(args, "--gate")
+				}
+				var out, errs bytes.Buffer
+				code := run(args, &out, &errs)
+				if code != 1 || out.Len() != 0 {
+					t.Fatalf("exit %d, stdout %s, stderr %s", code, &out, &errs)
+				}
+				codeFile := name == "Makefile" || name == "Dockerfile" || name == "docs/setup.go" || name == "config.yaml"
+				want := "only documentation files changed between HEAD and the working tree (" + name + "); nothing to review"
+				if name == "" {
+					want = "no changes found between HEAD and the working tree; nothing to review"
+				}
+				if codeFile {
+					want = "claude reviewer"
+				}
+				if !strings.Contains(errs.String(), want) {
+					t.Fatalf("stderr %s, want %s", &errs, want)
+				}
+				_, err := os.Stat(log)
+				if !codeFile && !os.IsNotExist(err) {
+					t.Fatalf("reviewer invoked: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestDiffStat(t *testing.T) {
+	root := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		if out, err := exec.Command("git", append([]string{"-C", root}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git: %s %v", out, err)
+		}
+	}
+	git("init", "-b", "feature")
+	path := filepath.Join(root, "code.go")
+	if err := os.WriteFile(path, []byte("one\ntwo\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "code.go")
+	git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "-m", "initial")
+	for _, tc := range []struct {
+		content  string
+		ins, del int
+	}{
+		{"one\ntwo\n", 0, 0}, {"one\n", 0, 1}, {"", 0, 2}, {"one\ntwo\nthree\n", 1, 0}, {"one\nthree\nfour\n", 2, 1},
+	} {
+		if err := os.WriteFile(path, []byte(tc.content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		ins, del, err := diffStat(root, "HEAD")
+		if err != nil || ins != tc.ins || del != tc.del {
+			t.Fatalf("%q: +%d/-%d, %v; want +%d/-%d", tc.content, ins, del, err, tc.ins, tc.del)
+		}
+	}
+}
+
+func TestDocumentationAllowlist(t *testing.T) {
+	docs := []string{"README", "README.md", "README.txt", "LICENSE", "LICENSE.md", "CHANGELOG", "CHANGELOG.md", "CONTRIBUTING", "CONTRIBUTING.md", "NOTICE", "NOTICE.md", "guide.rst", "guide.txt", "guide.md"}
+	for _, name := range docs {
+		if err := checkReviewableDiff("main", []string{filepath.Join("nested", strings.ToUpper(name))}); err == nil {
+			t.Fatalf("not classified as doc: %s", name)
+		}
+	}
+	for _, name := range []string{"Makefile", "Dockerfile", "docs/setup.go", "README.go", "LICENSE.txt.go", "config.yaml", "docs/settings.json", "docs/manual.pdf"} {
+		if err := checkReviewableDiff("main", append(append([]string{}, docs...), name)); err != nil {
+			t.Fatalf("code classified as doc: %s: %v", name, err)
+		}
 	}
 }
 
@@ -439,6 +694,11 @@ func TestRunHelpAndMissingKey(t *testing.T) {
 	}
 	if !strings.Contains(errs.String(), "-reviewer=<cli[,cli,...]>") || !strings.Contains(errs.String(), "override reviewer_pool for this run") {
 		t.Fatalf("help missing reviewer flag: %s", &errs)
+	}
+	for _, text := range []string{"full Git branch range", "-base <ref>", "esuna --base <ref>"} {
+		if !strings.Contains(errs.String(), text) {
+			t.Fatalf("help missing %q: %s", text, &errs)
+		}
 	}
 	errs.Reset()
 	if code := run([]string{"--json"}, &out, &errs); code != 1 || !strings.Contains(errs.String(), "TYPESAFE_API_KEY") || out.Len() != 0 {

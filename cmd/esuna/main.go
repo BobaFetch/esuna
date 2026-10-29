@@ -10,7 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"esuna/internal/config"
@@ -38,6 +40,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	merge := flags.Bool("merge", false, "run reviewers independently and merge findings (default)")
 	chain := flags.Bool("chain", false, "run reviewers sequentially in configured pool order")
 	gate := flags.Bool("gate", false, "exit nonzero for confident P0 findings")
+	base := flags.String("base", "", "diff base ref, bypassing automatic resolution")
 	author := flags.String("author-model", "", "change author CLI (claude, codex, muse, grok); excluded from review")
 	reviewers := flags.String("reviewer", "", "override reviewer_pool for this run with comma-separated CLIs (claude, codex, muse, grok)")
 	if err := flags.Parse(args); err != nil {
@@ -74,7 +77,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	// Only explicitly supplied flags override repository settings. An empty
 	// --author-model clears the exclusion; an empty --reviewer is invalid.
+	explicitBase := false
 	flags.Visit(func(f *flag.Flag) {
+		if f.Name == "base" {
+			explicitBase = *base != ""
+		}
 		if f.Name == "author-model" {
 			cfg.AuthorModel = *author
 		}
@@ -100,7 +107,24 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return fail(err)
 	}
 	defer os.Chdir(cwd)
-	bundle, err := repocontext.Build(root, reviewBase(root), *deep)
+	if !explicitBase {
+		*base = reviewBase(root)
+	}
+	if *base == "" {
+		return fail(fmt.Errorf("could not find a merge-base with the resolved mainline; specify --base <ref>"))
+	}
+	touched, err := repocontext.TouchedFiles(*base)
+	if err != nil {
+		return fail(err)
+	}
+	if err := checkReviewableDiff(*base, touched); err != nil {
+		return fail(err)
+	}
+	insertions, deletions, err := diffStat(root, *base)
+	if err != nil {
+		return fail(err)
+	}
+	bundle, err := repocontext.Build(root, *base, *deep)
 	if err != nil {
 		return fail(err)
 	}
@@ -145,7 +169,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	} else {
 		confidence /= float64(len(findings))
 	}
-	result := contract.Result{Summary: fmt.Sprintf("%d findings across %d files", len(findings), len(files)), OverallConfidence: confidence, Findings: findings}
+	result := contract.Result{Summary: fmt.Sprintf("%d findings across %d files", len(findings), len(files)), OverallConfidence: confidence, Findings: findings, FilesReviewed: len(touched), Base: *base}
+	// Keep stdout machine-readable with --json; show the same header in both modes.
+	if _, err := fmt.Fprintf(stderr, "reviewing %d files, +%d/-%d, base %s..HEAD\n", len(touched), insertions, deletions, *base); err != nil {
+		return fail(err)
+	}
 	if err := printResult(stdout, result, *jsonOutput); err != nil {
 		return fail(err)
 	}
@@ -153,6 +181,51 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 var lookPath = exec.LookPath
+
+func diffStat(root, base string) (insertions, deletions int, err error) {
+	cmd := exec.Command("git", "diff", "--no-ext-diff", "--no-textconv", "--shortstat", "--end-of-options", base, "--")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, 0, fmt.Errorf("git diff stat against %q: %w", base, err)
+	}
+	for _, part := range strings.Split(string(out), ",") {
+		fields := strings.Fields(part)
+		if len(fields) != 2 {
+			continue
+		}
+		switch fields[1] {
+		case "insertion(+)", "insertions(+)":
+			insertions, err = strconv.Atoi(fields[0])
+		case "deletion(-)", "deletions(-)":
+			deletions, err = strconv.Atoi(fields[0])
+		}
+		if err != nil {
+			return 0, 0, fmt.Errorf("parse git diff stat: %w", err)
+		}
+	}
+	return insertions, deletions, nil
+}
+
+// Reject non-reviews before building context or invoking reviewers/scoring.
+func checkReviewableDiff(base string, files []string) error {
+	if len(files) == 0 {
+		return fmt.Errorf("no changes found between %s and the working tree; nothing to review", base)
+	}
+	for _, file := range files {
+		name := strings.ToLower(filepath.Base(file))
+		switch name {
+		case "readme", "readme.md", "readme.txt", "license", "license.md", "changelog", "changelog.md", "contributing", "contributing.md", "notice", "notice.md":
+			continue
+		}
+		switch strings.ToLower(filepath.Ext(file)) {
+		case ".md", ".txt", ".rst":
+			continue
+		}
+		return nil
+	}
+	return fmt.Errorf("only documentation files changed between %s and the working tree (%s); nothing to review", base, strings.Join(files, ", "))
+}
 
 // Mirror .esuna.conf's reviewer_pool validation without changing config parsing.
 func parseReviewerPool(value string) ([]reviewer.Model, error) {
@@ -201,13 +274,28 @@ func configuredPool(cfg *config.Config, stderr io.Writer) ([]reviewer.Runner, er
 	return pool, nil
 }
 
-// Compare to the upstream merge-base when available, otherwise the previous
-// commit (new branches), or HEAD for a repository with only its initial commit.
+// Compare the full branch to its upstream or the first available mainline.
 // This includes committed changes for pre-push, plus staged/unstaged changes.
 func reviewBase(root string) string {
 	cmd := exec.Command("git", "merge-base", "HEAD", "@{upstream}")
 	cmd.Dir = root
 	if out, err := cmd.Output(); err == nil {
+		return strings.TrimSpace(string(out))
+	}
+	for _, ref := range []string{"origin/main", "origin/master", "main", "master"} {
+		cmd = exec.Command("git", "rev-parse", "--verify", ref)
+		cmd.Dir = root
+		if err := cmd.Run(); err != nil {
+			continue
+		}
+		cmd = exec.Command("git", "merge-base", ref, "HEAD")
+		cmd.Dir = root
+		out, err := cmd.Output()
+		if err != nil {
+			// A mainline exists but has no usable merge-base. Do not silently
+			// fall back to reviewing just the last commit.
+			return ""
+		}
 		return strings.TrimSpace(string(out))
 	}
 	cmd = exec.Command("git", "rev-parse", "--verify", "HEAD^")
@@ -326,7 +414,7 @@ func printResult(stdout io.Writer, result contract.Result, jsonOutput bool) erro
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprintln(w, `esuna reviews the current Git change with independent coding agents and calibrates finding confidence.
+	fmt.Fprintln(w, `esuna reviews the full Git branch range against an automatic or explicit base, including staged and unstaged changes, and calibrates finding confidence.
 
 Usage: esuna [flags]
 
@@ -338,6 +426,7 @@ Flags:`)
   -merge         run reviewers independently and merge findings (default)
   -chain         run reviewers sequentially in configured pool order
   -gate          exit nonzero for confident P0 findings
+  -base <ref>    diff base ref, bypassing automatic resolution
   -author-model  change author CLI (claude, codex, muse, grok); excluded from review
   -reviewer=<cli[,cli,...]>  override reviewer_pool for this run (claude, codex, muse, grok)
 
@@ -345,6 +434,7 @@ Examples:
   esuna
   esuna --gate
   esuna --json
+  esuna --base <ref>
   esuna --chain --verify
   esuna install-hook [--target <repo-root>] [--gate]
 
